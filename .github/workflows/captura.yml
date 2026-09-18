@@ -1,0 +1,111 @@
+name: captura
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capturar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Habilitar KVM (aceleracion)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm || true
+          ls -l /dev/kvm || echo "NO /dev/kvm"
+
+      - name: Instalar Android SDK + emulator
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip curl
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd /tmp
+          curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdtools.zip -d $HOME/android-sdk/cmdline-tools
+          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
+          export PATH=$HOME/android-sdk/cmdline-tools/latest/bin:$PATH
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "platforms;android-30" "system-images;android-30;google_apis;x86_64" > /dev/null
+          echo "SDK listo"
+
+      - name: Crear AVD
+        run: |
+          set -e
+          export PATH=$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/emulator:$HOME/android-sdk/platform-tools:$PATH
+          echo no | avdmanager create avd -n test -k "system-images;android-30;google_apis;x86_64" -d pixel_5 --force
+          echo "AVD creado"
+
+      - name: Arrancar emulador
+        run: |
+          export PATH=$HOME/android-sdk/emulator:$HOME/android-sdk/platform-tools:$PATH
+          nohup emulator -avd test -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -accel on > /tmp/emu.log 2>&1 &
+          adb wait-for-device
+          echo "esperando boot..."
+          for i in $(seq 1 120); do
+            B=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$B" = "1" ]; then echo "BOOT OK en $i"; break; fi
+            sleep 5
+          done
+          adb devices -l
+          adb shell getprop ro.product.cpu.abi
+
+      - name: Root + instalar APK
+        run: |
+          export PATH=$HOME/android-sdk/platform-tools:$PATH
+          adb root || true
+          sleep 3
+          adb wait-for-device || true
+          adb install -r -g app.apk || adb install app.apk
+          adb shell pm list packages | grep -i netxxus || echo "no aparece el paquete"
+
+      - name: Limpiar logcat y abrir la app
+        run: |
+          export PATH=$HOME/android-sdk/platform-tools:$PATH
+          adb logcat -c || true
+          adb shell monkey -p com.xuper.netxxus -c android.intent.category.LAUNCHER 1 || true
+          echo "app lanzada, esperando 240 s para que llegue el push..."
+          sleep 240
+          adb shell pidof com.xuper.netxxus || echo "app no viva"
+
+      - name: Capturar DomainCache y logcat
+        run: |
+          export PATH=$HOME/android-sdk/platform-tools:$PATH
+          mkdir -p out
+          adb logcat -d > out/logcat_full.txt 2>&1 || true
+          adb shell "logcat -d" > out/logcat2.txt 2>&1 || true
+          # intentar leer el XML de varias formas
+          adb shell "su 0 cat /data/data/com.xuper.netxxus/shared_prefs/DomainCache.xml" > out/DomainCache_su.xml 2>&1 || true
+          adb shell "cat /data/data/com.xuper.netxxus/shared_prefs/DomainCache.xml" > out/DomainCache_cat.xml 2>&1 || true
+          adb shell "run-as com.xuper.netxxus cat shared_prefs/DomainCache.xml" > out/DomainCache_runas.xml 2>&1 || true
+          # listar el directorio de prefs
+          adb shell "su 0 ls -la /data/data/com.xuper.netxxus/shared_prefs/" > out/prefs_ls.txt 2>&1 || true
+          adb shell "ls -la /data/data/com.xuper.netxxus/" > out/pkg_ls.txt 2>&1 || true
+          # grep del log
+          grep -a -i -E "UMDomainHandler|PORTAL_MAIN|portal_main" out/logcat_full.txt > out/hallazgos.txt 2>&1 || true
+          echo "=== RESUMEN ==="
+          wc -c out/*.txt out/*.xml 2>/dev/null || true
+          echo "--- hallazgos ---"
+          cat out/hallazgos.txt || true
+          echo "--- DomainCache (su) ---"
+          cat out/DomainCache_su.xml || true
+          echo "--- DomainCache (run-as) ---"
+          cat out/DomainCache_runas.xml || true
+
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: captura
+          path: out/
+          if-no-files-found: warn
+          retention-days: 7
